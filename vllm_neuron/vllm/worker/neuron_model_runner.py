@@ -798,6 +798,45 @@ def build_sampling_params_tensor(
     return result
 
 
+def build_sampling_params_tensor_host(
+    sampling_metadata, num_reqs: int, num_rows: int = 0
+) -> torch.Tensor:
+    """Host version of :func:`build_sampling_params_tensor`, padded to ``num_rows`` rows.
+
+    Same values: [top_k, top_p, temperature] float32 per request, defaults (-1, 1, 0) for an
+    absent parameter and for the padded rows. Built on the CPU so that the caller uploads one
+    tensor, instead of stacking device tensors (which falls back to the CPU on Neuron and
+    reads them back every step).
+
+    Args:
+        sampling_metadata: vLLM SamplingMetadata with per-request params.
+        num_reqs: Number of active requests in the batch.
+        num_rows: Total rows (padding target); fewer than ``num_reqs`` means no padding.
+
+    Returns:
+        CPU tensor of shape (max(num_reqs, num_rows), 3).
+
+    Example:
+        >>> from types import SimpleNamespace
+        >>> md = SimpleNamespace(top_k=None, top_p=torch.tensor([0.95]), temperature=None)
+        >>> build_sampling_params_tensor_host(md, 1, 2).tolist()
+        [[-1.0, 0.949999988079071, 0.0], [-1.0, 1.0, 0.0]]
+    """
+    rows = max(num_reqs, num_rows)
+    out = torch.empty((rows, 3), dtype=torch.float32)
+    out[:, 0] = -1.0
+    out[:, 1] = 1.0
+    out[:, 2] = 0.0
+    for col, value in (
+        (0, sampling_metadata.top_k),
+        (1, sampling_metadata.top_p),
+        (2, sampling_metadata.temperature),
+    ):
+        if value is not None:
+            out[:num_reqs, col] = value.cpu().float()[:num_reqs]
+    return out
+
+
 # TODO: Inherit from LoRAModelRunnerMixin to support LoRA
 def _kv_tensor_layer_names(kv_cache_tensor) -> list[str]:
     """Return the layer names a ``KVCacheTensor`` covers, from ``layers`` or ``shared_by``.
@@ -842,6 +881,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     _model_supports_async_reorder: bool | None = None
     _block_table_groups: "dict[int, _BlockTableGroupState] | None" = None
     _constant_tensors: "dict[tuple, torch.Tensor] | None" = None
+    # VLLM_NEURON_HOST_PREP_CACHE, read once (None = not read yet), and the per-step input
+    # caches it enables: one entry per (kind, KV-cache group), see ``_prep_cached``.
+    _host_prep_cache_on: bool | None = None
+    _prep_cache: "dict[tuple, tuple] | None" = None
     _swa_groups: "dict[int, _SwaGroupState] | None" = None
     # A proven result can be None, so a second flag records whether the proof ran.
     _dp_identity_resolved: bool = False
@@ -2956,7 +2999,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """Compile the KV-clearing graph (clears the null block). Called after model warmup:
         executing on device earlier would precede the parallel-trace forks."""
         if getattr(self, "_kv_clear_groups", None):
-            self._clear_kv_blocks([0])
+            if self._state_kv_alias():
+                # Shared pool: warmup's dummy block tables wrote float32 state and K/V into
+                # arbitrary blocks; clear the whole pool once so no block a request reads
+                # (as attention or state) starts with state bits read as bf16 (NaN lanes).
+                n = self._kv_clear_caches[0].shape[0] // self._kv_clear_ratio
+                self._clear_kv_blocks(list(range(n)))
+                logger.info("Cleared all %d shared-pool blocks after warmup", n)
+            else:
+                self._clear_kv_blocks([0])
 
     def _clear_kv_blocks(self, manager_blocks: list[int]) -> None:
         ratio = self._kv_clear_ratio
@@ -3022,6 +3073,70 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return False
         return not envs.VLLM_NEURON_SHARED_STATE_POOL
 
+    def _state_kv_alias(self) -> bool:
+        """Bind shared-pool recurrent state as the attention K/V tensors of its raw buffer.
+
+        In the shared pool (prefix caching, Mamba align mode) every raw buffer is both one
+        attention layer's K/V caches (bf16) and the float32 state halves of several state
+        layers. Bound as separate views, they reach the graph as mutated inputs that overlap
+        with different dtypes, which AOTAutograd rejects ("does not yet handle input
+        mutations on views with different dtypes"). With this on, a state layer's halves
+        ARE the attention layer's K and V tensor objects (same dtype, deduplicated graph
+        inputs, no aliasing), plus the page count; the model views them as float32 pages
+        inside its kernels. ``VLLM_NEURON_STATE_KV_ALIAS``: ``auto`` (default: on for a
+        shared pool if the model sets ``supports_state_kv_alias``), ``1``, ``0``.
+        The dedicated pool (prefix caching off) is unchanged."""
+        if self._dedicated_state_pool():
+            return False
+        mode = os.environ.get("VLLM_NEURON_STATE_KV_ALIAS", "auto")
+        if mode == "auto":
+            return bool(getattr(self.model, "supports_state_kv_alias", False))
+        return mode == "1"
+
+    def _bind_state_as_kv(self, state_caches, kv_slices, shared_dtype_view) -> None:
+        """Replace each ``[raw, page_bytes]`` placeholder by ``[k, v, num_pages]``."""
+        by_raw: dict[int, list[torch.Tensor]] = {}
+        for (raw_id, _dtype, kv_shape), slices in kv_slices.items():
+            if kv_shape[0] == 2:
+                by_raw.setdefault(raw_id, slices)
+        self._state_kv_page_views: dict[int, torch.Tensor] = {}
+        for name, entry in list(state_caches.items()):
+            if len(entry) != 2 or not isinstance(entry[1], int):
+                continue
+            raw, page_bytes = entry
+            num_pages = raw.numel() // page_bytes
+            slices = by_raw.get(id(raw))
+            if slices is None:
+                # No attention layer on this buffer: two bf16 halves of one shared view.
+                typed = shared_dtype_view(raw, torch.bfloat16).view(2, num_pages, -1)
+                k, v = typed[0], typed[1]
+                kv_slices[(id(raw), torch.bfloat16, ("state", num_pages))] = [k, v, typed]
+            else:
+                k, v = slices[0], slices[1]
+            assert k.numel() % num_pages == 0 and k.dtype.itemsize == 2, (name, k.shape, k.dtype)
+            state_caches[name] = [k, v, num_pages]
+        logger.info(
+            "Recurrent state bound as the K/V tensors of the shared pool "
+            "(VLLM_NEURON_STATE_KV_ALIAS) for %d state layers",
+            sum(1 for e in state_caches.values() if len(e) == 3),
+        )
+
+    def _state_copy_views(self, entry: list) -> list[torch.Tensor]:
+        """float32 [pages, rows, 128] views of a KV-aliased state entry (k, v, num_pages), one
+        object per tensor. float32, as the dedicated-pool copy uses: copying the state as
+        2-byte floats could canonicalize the low halves of float32 values that read as NaN."""
+        k, v, num_pages = entry
+        out = []
+        for t in (k, v):
+            view = self._state_kv_page_views.get(id(t))
+            if view is None:
+                view = t.view(num_pages, -1).view(torch.float32)
+                if view.shape[1] % 128 == 0:
+                    view = view.view(num_pages, view.shape[1] // 128, 128)
+                self._state_kv_page_views[id(t)] = view
+            out.append(view)
+        return out
+
     def _state_page(self, layer_name: str, spec: "MambaSpec") -> tuple:
         """(layout, page bytes) of a recurrent-state layer's real page: the spec's own, or the
         one recorded for a dedicated pool, whose spec carries a placeholder page."""
@@ -3047,13 +3162,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         state. Its 1 + num_speculative_blocks state blocks map to pages
         1 + slot * (1 + num_speculative_blocks) + j. The block table can be wider (vLLM pads
         it for alignment); the extra columns map to the null page 0."""
+        return self._state_pool_table_host(padded_num_reqs, n_blocks).to(self.device)
+
+    def _state_pool_assign_slots(self, padded_num_reqs: int) -> tuple:
+        """Free the slots of requests that are gone and give each batch row's request a slot.
+
+        Returns:
+            The slot of each of the first ``padded_num_reqs`` rows (None for an empty row).
+        """
         slots = self._state_pool_slots
         for req_id in [r for r in slots if r not in self.requests]:
             self._state_pool_free.append(slots.pop(req_id))
-        table = torch.full((padded_num_reqs, n_blocks), -1, dtype=torch.int32)
-        pages = min(self._state_pool_slot_pages, n_blocks)
-        for i, req_id in enumerate(self.input_batch.req_ids[:padded_num_reqs]):
+        row_slots = []
+        for req_id in self.input_batch.req_ids[:padded_num_reqs]:
             if req_id is None:
+                row_slots.append(None)
                 continue
             if req_id not in slots:
                 if not self._state_pool_free:
@@ -3061,13 +3184,50 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "Recurrent-state pool exhausted: more live requests than max_num_seqs"
                     )
                 slots[req_id] = self._state_pool_free.pop(0)
+            row_slots.append(slots[req_id])
+        # req_ids can be shorter than padded_num_reqs; the table pads with -1 rows.
+        row_slots += [None] * (padded_num_reqs - len(row_slots))
+        return tuple(row_slots)
+
+    def _state_pool_tables_cached(
+        self, group_id: int, padded_num_reqs: int, n_blocks: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(table, distinct copy) of ``_state_pool_table`` for one group, rebuilt and uploaded
+        only when a row's slot, the row count or the width changes. The table is a function
+        of the per-row slots, so equal slots give the same bits."""
+        row_slots = self._state_pool_assign_slots(padded_num_reqs)
+
+        def build() -> tuple[torch.Tensor, torch.Tensor]:
+            host = self._state_pool_table_host(padded_num_reqs, n_blocks, row_slots)
+            # Two uploads instead of upload + device clone: same bits, distinct objects (the
+            # host clone keeps them distinct when the device is the CPU).
+            return host.to(self.device), host.clone().to(self.device)
+
+        return self._prep_cached(
+            ("state_pool", group_id),
+            (padded_num_reqs, n_blocks, self._state_pool_slot_pages, row_slots),
+            (),
+            build,
+        )
+
+    def _state_pool_table_host(
+        self, padded_num_reqs: int, n_blocks: int, row_slots: tuple | None = None
+    ) -> torch.Tensor:
+        """Host [padded_num_reqs, n_blocks] int32 state-pool table (see _state_pool_table)."""
+        if row_slots is None:
+            row_slots = self._state_pool_assign_slots(padded_num_reqs)
+        table = torch.full((padded_num_reqs, n_blocks), -1, dtype=torch.int32)
+        pages = min(self._state_pool_slot_pages, n_blocks)
+        for i, slot in enumerate(row_slots):
+            if slot is None:
+                continue
             table[i] = 0
             table[i, :pages] = (
                 1
-                + slots[req_id] * self._state_pool_slot_pages
+                + slot * self._state_pool_slot_pages
                 + torch.arange(pages, dtype=torch.int32)
             )
-        return table.to(self.device)
+        return table
 
     def _release_state_pool_slots(self, scheduler_output: "SchedulerOutput") -> None:
         """Free the state-pool slots of finished and preempted requests (a preempted request
@@ -3113,10 +3273,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         pages, page_groups = [], []
         for k, gi in enumerate(self._mamba_align_groups):
             for name in groups[gi].layer_names:
-                for half in state_caches[name]:
+                entry = state_caches[name]
+                kv_alias = len(entry) == 3 and isinstance(entry[2], int)
+                if kv_alias:
+                    # Already [pages, rows, 128], one object per buffer half.
+                    entry = self._state_copy_views(entry)
+                for half in entry:
                     # [pages, rows, 128] views: a single [pages, half] row would be copied with
                     # per-element descriptors.
-                    if half.shape[1] % 128 == 0:
+                    if not kv_alias and half.shape[1] % 128 == 0:
                         half = half.view(half.shape[0], half.shape[1] // 128, 128)
                     pages.append(half)
                     page_groups.append(k)
@@ -3633,6 +3798,71 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             tensor = factory()
             self._constant_tensors[key] = tensor
         return tensor
+
+    def _host_prep_cache_enabled(self) -> bool:
+        """Whether VLLM_NEURON_HOST_PREP_CACHE is on (read once per runner)."""
+        if self._host_prep_cache_on is None:
+            self._host_prep_cache_on = bool(envs.VLLM_NEURON_HOST_PREP_CACHE)
+        return self._host_prep_cache_on
+
+    def _prep_cached(
+        self, slot: tuple, key: tuple, refs: tuple, factory: Callable[[], Any]
+    ) -> Any:
+        """Return the value built for ``key`` in ``slot`` on the previous call, or rebuild it.
+
+        A one-entry cache per slot for per-step decode inputs whose contents are a function of
+        ``key`` plus the identity of the objects in ``refs``. The entry holds the objects in
+        ``refs`` so that their ids cannot be reused while it lives. Reuse is safe while an
+        earlier step's NEFF still reads the value, because a hit means the same bits, and a
+        miss builds a new tensor instead of writing the old one. ``slot`` must include the
+        KV-cache group id for graph inputs: torch.compile guards reject one tensor object in
+        two places of the same call.
+
+        Args:
+            slot: Which input this is, e.g. ("full_bt", group_id).
+            key: Hashable values the contents depend on.
+            refs: Objects the contents depend on by identity (compared with ``is``).
+            factory: Builds the value on a miss.
+
+        Returns:
+            The cached or newly built value.
+        """
+        if not self._host_prep_cache_enabled():
+            return factory()
+        if self._prep_cache is None:
+            self._prep_cache = {}
+        hit = self._prep_cache.get(slot)
+        if (
+            hit is not None
+            and hit[0] == key
+            and len(hit[1]) == len(refs)
+            and all(a is b for a, b in zip(hit[1], refs))
+        ):
+            return hit[2]
+        value = factory()
+        self._prep_cache[slot] = (key, refs, value)
+        return value
+
+    def _full_block_table_clone(
+        self, group_id: int, blk_table: Any, padded_num_reqs: int
+    ) -> torch.Tensor:
+        """A distinct device copy of ``blk_table.get_device_tensor(padded_num_reqs)``.
+
+        The copy is reused while the group's device table is the same tensor object that
+        ``_block_table_device_tensor`` uploaded: that upload is out of place, so an unchanged
+        object means unchanged contents. Any other source (a table not written by that
+        upload) is cloned every step, as before.
+        """
+        src = blk_table.block_table.gpu
+        state = (self._block_table_groups or {}).get(group_id)
+        if state is None or state.uploaded_device is not src:
+            return blk_table.get_device_tensor(padded_num_reqs).clone()
+        return self._prep_cached(
+            ("full_bt", group_id),
+            (padded_num_reqs,),
+            (src,),
+            lambda: blk_table.get_device_tensor(padded_num_reqs).clone(),
+        )
 
     @staticmethod
     def _raw_block_table(buffer: Any) -> np.ndarray:
@@ -5980,7 +6210,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # always traces with two distinct tensors. For SWA models, the
             # clone is also necessary because ``blk_table_tensor`` gets
             # reassigned to a trimmed view below.
-            full_blk_table_tensor = blk_table_tensor.clone()
+            # With VLLM_NEURON_HOST_PREP_CACHE the clone is reused while the group's device
+            # table is unchanged (a device-to-device copy costs ~0.2 ms of host time per
+            # group), and it is skipped for the state-pool and align groups, which replace it.
+            if not self._host_prep_cache_enabled():
+                full_blk_table_tensor = blk_table_tensor.clone()
+            elif kv_cache_group_id in getattr(
+                self, "_state_pool_groups", ()
+            ) or kv_cache_group_id in getattr(self, "_mamba_align_groups", ()):
+                full_blk_table_tensor = None
+            else:
+                full_blk_table_tensor = self._full_block_table_clone(
+                    kv_cache_group_id, blk_table, padded_num_reqs
+                )
             # for dcp, slot mapping would set the slot for non-owned tokens to NULL_BLOCK_ID
             # A prefix upload sizes the device tensor for the token count of its own call
             # site. Another caller can ask for more tokens, because the jump-forward branch
@@ -6129,10 +6371,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     state_in[i] = self._mamba_state_in.get(req_id, 0)
                 state_in = state_in.to(self.device)
             if kv_cache_group_id in getattr(self, "_state_pool_groups", ()):
-                blk_table_tensor = self._state_pool_table(
-                    padded_num_reqs, blk_table_tensor.shape[1]
-                )
-                full_blk_table_tensor = blk_table_tensor.clone()
+                if self._host_prep_cache_enabled():
+                    blk_table_tensor, full_blk_table_tensor = (
+                        self._state_pool_tables_cached(
+                            kv_cache_group_id, padded_num_reqs, blk_table_tensor.shape[1]
+                        )
+                    )
+                else:
+                    blk_table_tensor = self._state_pool_table(
+                        padded_num_reqs, blk_table_tensor.shape[1]
+                    )
+                    full_blk_table_tensor = blk_table_tensor.clone()
             if kv_cache_group_id in getattr(self, "_mamba_align_groups", ()):
                 # Align mode: the running state's block only; token validity from the
                 # attention group's slots (state blocks before it may be the null block).
@@ -9440,9 +9689,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             sampling_metadata = self.input_batch.sampling_metadata
             num_reqs = self.input_batch.num_reqs
 
-            sampling_params_tensor = build_sampling_params_tensor(
-                sampling_metadata, num_reqs, self.device
-            )
+            if self._host_prep_cache_enabled():
+                bt_rows = 0
+                if attn_metadata:
+                    first_meta = next(iter(attn_metadata.values()))
+                    bt_rows = first_meta["block_table_tensor"].shape[0]
+                # SamplingMetadata is replaced whenever the batch's sampling state changes
+                # (InputBatch.refresh_metadata), so its identity plus the shape is the key.
+                sampling_params_tensor = self._prep_cached(
+                    ("sampling_params",),
+                    (num_reqs, bt_rows),
+                    (sampling_metadata,),
+                    lambda: build_sampling_params_tensor_host(
+                        sampling_metadata, num_reqs, bt_rows
+                    ).to(self.device),
+                )
+            else:
+                sampling_params_tensor = build_sampling_params_tensor(
+                    sampling_metadata, num_reqs, self.device
+                )
 
             # Pad sampling_params to match the decode batch bucket size.
             # block_table rows == padded_num_reqs (1 token per request),
@@ -11555,6 +11820,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._block_table_groups.clear()
         if self._swa_groups:
             self._swa_groups.clear()
+        if self._prep_cache:
+            self._prep_cache.clear()
 
         # >>> GK: contiguous group_size-deep stacked KV cache <<<
         # The GPT-OSS decode giga-kernel indexes its cache axis by buffer
@@ -11788,6 +12055,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                             )
                             for _ in range(2)
                         ]
+                    elif self._state_kv_alias():
+                        # Bound after the loop as the attention K/V tensors of the same raw
+                        # buffer (see _bind_state_as_kv), once they exist.
+                        state_caches[layer_name] = [
+                            kv_cache_raw_tensors[layer_name],
+                            page_bytes,
+                        ]
                     else:
                         state_caches[layer_name] = list(
                             _paired_half_views(
@@ -11799,6 +12073,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
                 )
+
+        if self._state_kv_alias():
+            self._bind_state_as_kv(state_caches, _kv_slices, _shared_dtype_view)
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
@@ -11915,7 +12192,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Power-of-two attention pages per state page, so the enlarged attention block
             # divides max_model_len (e.g. Qwen3.8-27B with FP8 KV would otherwise give 1792-token
             # blocks, block tables of 1064 entries, and odd-stride FP8 DMAs neuronx-cc rejects).
-            page = attn_page * (1 << (page // attn_page - 1).bit_length())
+            # A dedicated pool's real page never sizes an attention block (vLLM sees the
+            # placeholder below), so it keeps the padded size: NemotronH's 530 KB Mamba-2
+            # page would otherwise round up to 1 MiB, ~1.1 GiB per rank at 128 sequences.
+            dedicated = self._dedicated_state_pool()
+            pow2_page = attn_page * (1 << (page // attn_page - 1).bit_length())
+            if not (dedicated and os.environ.get("VLLM_NEURON_STATE_POOL_POW2_PAGES", "0") != "1"):
+                page = pow2_page
             shapes, dtypes = tuple(layer.shapes), tuple(layer.dtypes)
             if dedicated:
                 self._state_real_pages[layer.name] = (layout, page)

@@ -1659,6 +1659,20 @@ class NeuronWorker(WorkerBase):
             )
         elif not envs.VLLM_NEURON_CPU_COMPILE:
             self._warmup_prefill()
+            # R2-03p2: in the shared pool (prefix caching) the prefill warmup's dummy block table writes
+            # the attention K/V of its dummy tokens into block 0, which is also every state layer's null
+            # page; the decode warmup's padding rows then read those bits as float32 Mamba state.
+            # VLLM_NEURON_WARMUP_CLEAR_SHARED: "auto" (default) clears the shared pool before the decode
+            # warmup when the state is KV-aliased (the model's null-page prefill writes page 0, nemotron_h
+            # NEMOTRON_H_PREFILL_NULL_WRITE=page0); "1" always, "0" never. The dedicated pool is unchanged.
+            _clr = os.environ.get("VLLM_NEURON_WARMUP_CLEAR_SHARED", "auto")
+            if hasattr(self.model_runner, "warm_up_kv_block_clearing") and (
+                _clr == "1"
+                or (_clr == "auto" and getattr(self.model_runner, "_kv_clear_groups", None)
+                    and self.model_runner._state_kv_alias())
+            ):
+                self.model_runner.warm_up_kv_block_clearing()
+                logger.info("R2-03p2: cleared the shared pool after the prefill warmup")
 
         # === Decode warmup ===
         if skip_decode_warmup:

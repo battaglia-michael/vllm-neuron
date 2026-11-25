@@ -14,6 +14,7 @@ from nkilib.experimental.transformer.attention_block_tkg_sharding import (
 
 from typing import Optional, Tuple
 
+import os
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.distributed import ProcessGroup
@@ -1330,6 +1331,9 @@ def _can_use_attention_block_kernel(
     reside on a NeuronCore device or CPU with the NKI simulator; ``False`` otherwise (→ PyTorch fallback).
     """
     if not can_run_kernel(X):
+        return False
+    # T11b diagnostic: force the torch fallback (default off).
+    if os.environ.get("VLLM_NEURON_ATTN_DECODE_TORCH") == "1":
         return False
 
     # TODO: Enable once the attention-DP + DCP kernel combination is covered

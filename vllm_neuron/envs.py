@@ -55,6 +55,9 @@ if TYPE_CHECKING:
     # Bound the vLLM shm_broadcast reader spin. On by default, because an unbounded
     # spin holds one core per reader. Set it to 0 to keep upstream's timing.
     VLLM_NEURON_SHM_READER_SPIN_PATCH: bool = True
+    # Reuse per-step decode inputs (block-table clones, state-pool table, sampling params)
+    # while their source is unchanged. On by default; 0 rebuilds them every step.
+    VLLM_NEURON_HOST_PREP_CACHE: bool = True
     # sys.setswitchinterval for a worker process. 0 keeps CPython's default.
     VLLM_NEURON_GIL_SWITCH_INTERVAL_S: float = 0.0
     # Offset added to the MPExecutor collective and root-comm base ports.
@@ -387,6 +390,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the server down before it serves.
     "VLLM_NEURON_SHM_READER_SPIN_PATCH": lambda: optional_perf_bool(
         "VLLM_NEURON_SHM_READER_SPIN_PATCH", True
+    ),
+    # Host-only: keep the device copies of decode inputs whose source did not change since the
+    # previous step (the block-table clone per KV-cache group, the state-pool table and its
+    # clone, the sampling-parameter tensor) instead of rebuilding and uploading them. No graph
+    # change. Measured on Nemotron-H c=1 decode (R2-10c). 0 restores the per-step rebuild.
+    "VLLM_NEURON_HOST_PREP_CACHE": lambda: optional_perf_bool(
+        "VLLM_NEURON_HOST_PREP_CACHE", True
     ),
     # sys.setswitchinterval for a worker process, in seconds. 0 keeps CPython's own default.
     # Opt-in, like the two knobs above: the setting is global to the interpreter, so it changes
